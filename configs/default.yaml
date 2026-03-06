@@ -2,16 +2,21 @@
 
 model:
   llm_name: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+  llm_dtype: "float32"   # float32 avoids NaN in cross-attention training; use float16 for faster eval
   vision_dim: 768
   llm_dim: 2048   # TinyLlama hidden size
-  # Projector type: "linear" (LinearVisionToLLM) or "qformer" (QueryTransformer)
+  # Projector type: "linear" | "qformer" | "cross_attention" (injection inside LLM)
   projection_type: "qformer"
   projection_hidden_dim: 512  # bottleneck: 768→hidden→2048; use 0 for single linear
   # Q-Former (QueryTransformer) hyperparameters (used when projection_type == "qformer")
-  qformer_num_query_tokens: 8
+  qformer_num_query_tokens: 4
   qformer_num_layers: 1
   qformer_num_heads: 4
-  qformer_dropout: 0.2
+  qformer_dropout: 0.35
+  # Cross-attention inside LLM (used when projection_type == "cross_attention")
+  cross_attention_num_heads: 8
+  cross_attention_dropout: 0.1
+  cross_attention_residual_scale: 0.1   # scale cross-attn output before residual (avoids NaN)
 
 data:
   dataset_name: "HuggingFaceM4/VQAv2"
@@ -24,9 +29,9 @@ data:
 
 training:
   epochs: 5
-  learning_rate: 3.0e-5
-  weight_decay: 0.01        # stronger regularization (AdamW)
-  projection_dropout: 0.1   # dropout in projector (0 = disabled)
+  learning_rate: 1.0e-5
+  weight_decay: 0.02        # stronger regularization (AdamW)
+  projection_dropout: 0.2   # dropout in projector (0 = disabled)
   grad_clip_norm: 1.0       # max norm for gradient clipping (projector params)
   log_every: 10
   save_every: 1

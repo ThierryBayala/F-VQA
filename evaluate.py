@@ -11,9 +11,10 @@ from models.vision_encoder import VisionEncoder
 from models.frozen_llm import load_frozen_llm
 from models.fvqa_model import LinearVisionToLLM, FrozenVQA
 from models.query_transformer import QueryTransformer
+from models.vqa_cross_attn_llm import FrozenVQACrossAttn, CrossAttnInjector
 from data.vqa_dataset import load_vqa_subset, VQADataset
 from utils import load_config, load_checkpoint
-from metrics import compute_all_metrics, print_metrics_report
+from utils import compute_all_metrics, print_metrics_report
 
 
 def main():
@@ -31,7 +32,7 @@ def main():
     train_cfg = config.get("training", {})
     model_cfg = config.get("model", {})
     llm_name = model_cfg.get("llm_name", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-      # Projector type: "linear" (LinearVisionToLLM) or "qformer" (QueryTransformer)
+    # Projector type: "linear" | "qformer" | "cross_attention"
     projection_type = model_cfg.get("projection_type", "qformer").lower()
     vision_dim = model_cfg.get("vision_dim", 768)
     projection_hidden_dim = model_cfg.get("projection_hidden_dim", 0)
@@ -54,6 +55,17 @@ def main():
             num_heads=num_heads,
             dropout=qformer_dropout,
         )
+        load_checkpoint(args.checkpoint, model=projector)
+        model = FrozenVQA(vision_encoder=vision_encoder, projector=projector, llm=llm)
+    elif projection_type == "cross_attention":
+        injector = CrossAttnInjector.from_llm_config(
+            llm,
+            vision_dim=vision_dim,
+            num_heads=model_cfg.get("cross_attention_num_heads", 8),
+            dropout=model_cfg.get("cross_attention_dropout", projection_dropout),
+        )
+        load_checkpoint(args.checkpoint, model=injector)
+        model = FrozenVQACrossAttn(vision_encoder=vision_encoder, injector=injector, llm=llm)
     else:
         projector = LinearVisionToLLM(
             vision_dim=vision_dim,
@@ -61,12 +73,16 @@ def main():
             dropout=projection_dropout,
             hidden_dim=projection_hidden_dim,
         )
-    load_checkpoint(args.checkpoint, model=projector)
-    model = FrozenVQA(vision_encoder=vision_encoder, projector=projector, llm=llm)
+        load_checkpoint(args.checkpoint, model=projector)
+        model = FrozenVQA(vision_encoder=vision_encoder, projector=projector, llm=llm)
 
     main_device = next(llm.parameters()).device
+    llm_dtype = next(llm.parameters()).dtype
     vision_encoder.to(main_device)
-    projector.to(main_device)
+    if projection_type == "cross_attention":
+        injector.to(main_device).to(llm_dtype)
+    else:
+        projector.to(main_device).to(llm_dtype)
 
     image_size = data_cfg.get("image_size", 224)
     max_length = data_cfg.get("max_length", 256)
@@ -133,6 +149,7 @@ def main():
     all_references = []
     all_predictions = []
 
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
     with torch.no_grad():
         for batch in loader:
             images = batch["image"].to(main_device)
@@ -140,34 +157,62 @@ def main():
             answers = batch["answer"]
             bs = images.size(0)
 
-            vision_feat = model.vision(images)
-            vision_emb = model.projector(vision_feat)
+            if projection_type == "cross_attention":
+                for i in range(bs):
+                    prompt = prompt_prefix + questions[i] + prompt_suffix
+                    tok = tokenizer(
+                        prompt,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=max_length,
+                    )
+                    input_ids = tok["input_ids"].to(main_device)
+                    prompt_len = input_ids.shape[1]
+                    for _ in range(args.max_new_tokens):
+                        attn = (input_ids != pad_id).long().to(main_device)
+                        out = model(
+                            image=images[i : i + 1],
+                            question_ids=input_ids,
+                            attention_mask=attn,
+                            labels=None,
+                        )
+                        next_id = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                        input_ids = torch.cat([input_ids, next_id], dim=1)
+                        if next_id.item() == tokenizer.eos_token_id:
+                            break
+                    generated = tokenizer.decode(
+                        input_ids[0][prompt_len:], skip_special_tokens=True
+                    ).strip()
+                    all_references.append(answers[i])
+                    all_predictions.append(generated)
+            else:
+                vision_feat = model.vision(images)
+                vision_emb = model.projector(vision_feat)
+                for i in range(bs):
+                    prompt = prompt_prefix + questions[i] + prompt_suffix
+                    tok = tokenizer(
+                        prompt,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=max_length,
+                    )
+                    input_ids = tok["input_ids"].to(main_device)
+                    attention_mask = tok["attention_mask"].to(main_device)
+                    inputs_embeds = model.llm.get_input_embeddings()(input_ids)
+                    inputs_embeds[:, 0, :] = vision_emb[i : i + 1]
 
-            for i in range(bs):
-                prompt = prompt_prefix + questions[i] + prompt_suffix
-                tok = tokenizer(
-                    prompt,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=max_length,
-                )
-                input_ids = tok["input_ids"].to(main_device)
-                attention_mask = tok["attention_mask"].to(main_device)
-                inputs_embeds = model.llm.get_input_embeddings()(input_ids)
-                inputs_embeds[:, 0, :] = vision_emb[i : i + 1]
-
-                out = model.llm.generate(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=False,
-                    pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-                )
-                generated = tokenizer.decode(
-                    out[0][input_ids.shape[1] :], skip_special_tokens=True
-                ).strip()
-                all_references.append(answers[i])
-                all_predictions.append(generated)
+                    out = model.llm.generate(
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=attention_mask,
+                        max_new_tokens=args.max_new_tokens,
+                        do_sample=False,
+                        pad_token_id=pad_id,
+                    )
+                    generated = tokenizer.decode(
+                        out[0][input_ids.shape[1] :], skip_special_tokens=True
+                    ).strip()
+                    all_references.append(answers[i])
+                    all_predictions.append(generated)
 
     if all_references and all_predictions:
         metrics = compute_all_metrics(all_references, all_predictions)

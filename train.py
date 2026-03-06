@@ -11,8 +11,9 @@ from models.vision_encoder import VisionEncoder
 from models.frozen_llm import load_frozen_llm
 from models.fvqa_model import LinearVisionToLLM, FrozenVQA
 from models.query_transformer import QueryTransformer
+from models.vqa_cross_attn_llm import FrozenVQACrossAttn, CrossAttnInjector
 from data.vqa_dataset import load_vqa_subset, VQADataset
-from utils import load_config, get_device, save_checkpoint
+from utils import load_config, get_device, save_checkpoint, load_checkpoint
 
 
 def main():
@@ -36,7 +37,9 @@ def main():
 
     model_cfg = config.get("model", {})
     llm_name = model_cfg.get("llm_name", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-    # Projector type: "linear" (LinearVisionToLLM) or "qformer" (QueryTransformer)
+    llm_dtype_str = model_cfg.get("llm_dtype", "float32")
+    llm_dtype = getattr(torch, llm_dtype_str.strip().lower()) if isinstance(llm_dtype_str, str) else llm_dtype_str
+    # Projector type: "linear" | "qformer" | "cross_attention" (injection inside LLM)
     projection_type = model_cfg.get("projection_type", "qformer").lower()
     vision_dim = model_cfg.get("vision_dim", 768)
     projection_hidden_dim = model_cfg.get("projection_hidden_dim", 0)
@@ -47,11 +50,12 @@ def main():
     log_every = train_cfg.get("log_every", 10)
     save_every = train_cfg.get("save_every", 1)
     grad_clip_norm = train_cfg.get("grad_clip_norm", 1.0)
-    checkpoint_dir = Path(args.checkpoint_dir or paths_cfg.get("checkpoint_dir", "checkpoints"))
+    base_checkpoint_dir = Path(args.checkpoint_dir or paths_cfg.get("checkpoint_dir", "checkpoints"))
+    checkpoint_dir = base_checkpoint_dir / projection_type
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     print("Loading tokenizer and frozen LLM...")
-    llm, tokenizer = load_frozen_llm(llm_name)
+    llm, tokenizer = load_frozen_llm(llm_name, dtype=llm_dtype)
     llm.eval()
 
     print("Loading vision encoder and projector...")
@@ -71,6 +75,17 @@ def main():
             num_heads=num_heads,
             dropout=qformer_dropout,
         )
+        model = FrozenVQA(vision_encoder=vision_encoder, projector=projector, llm=llm)
+    elif projection_type == "cross_attention":
+        injector = CrossAttnInjector.from_llm_config(
+            llm,
+            vision_dim=vision_dim,
+            num_heads=model_cfg.get("cross_attention_num_heads", 8),
+            dropout=model_cfg.get("cross_attention_dropout", projection_dropout),
+            residual_scale=model_cfg.get("cross_attention_residual_scale", 0.1),
+        )
+        projector = injector  # saved as "projector" checkpoint
+        model = FrozenVQACrossAttn(vision_encoder=vision_encoder, injector=injector, llm=llm)
     else:
         projector = LinearVisionToLLM(
             vision_dim=vision_dim,
@@ -78,11 +93,12 @@ def main():
             dropout=projection_dropout,
             hidden_dim=projection_hidden_dim,
         )
-    model = FrozenVQA(vision_encoder=vision_encoder, projector=projector, llm=llm)
+        model = FrozenVQA(vision_encoder=vision_encoder, projector=projector, llm=llm)
 
     main_device = next(llm.parameters()).device
+    llm_dtype = next(llm.parameters()).dtype
     vision_encoder = vision_encoder.to(main_device)
-    projector = projector.to(main_device)
+    projector = projector.to(main_device).to(llm_dtype)
 
     optimizer = torch.optim.AdamW(projector.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -116,7 +132,15 @@ def main():
         pin_memory=True,
     )
 
-    print("Training (projector only)...")
+    # Run training only when no checkpoint exists
+    last_ckpt = checkpoint_dir / "projector_last.pt"
+    if last_ckpt.exists():
+        print(f"Checkpoint found at {last_ckpt}; loading and skipping training.")
+        load_checkpoint(str(last_ckpt), model=projector, device=main_device)
+        print("Done. Use this checkpoint for evaluation.")
+        return
+
+    print("No checkpoint found. Training (projector only)...")
     for epoch in range(epochs):
         model.train()
         total_loss = 0.0
@@ -133,6 +157,9 @@ def main():
                 labels=labels,
             )
             loss = outputs.loss
+            if not torch.isfinite(loss).item():
+                print(f"Epoch {epoch + 1} step {step + 1} loss=nan (skipping step)")
+                continue
             total_loss += loss.item()
 
             optimizer.zero_grad()

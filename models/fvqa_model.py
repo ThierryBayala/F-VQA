@@ -48,10 +48,11 @@ class FrozenVQA(nn.Module):
 
     def forward(self, image, question_ids, attention_mask, labels=None):
         vision_feat = self.vision(image)
-        vision_emb = self.projector(vision_feat)
+        proj_dtype = next(self.projector.parameters()).dtype
+        vision_emb = self.projector(vision_feat.to(proj_dtype))
 
         inputs_embeds = self.llm.get_input_embeddings()(question_ids)
-        inputs_embeds[:, 0, :] = vision_emb
+        inputs_embeds[:, 0, :] = vision_emb.to(inputs_embeds.dtype)
 
         outputs = self.llm(
             inputs_embeds=inputs_embeds,
